@@ -20,8 +20,10 @@ package org.apache.celeborn.service.deploy.worker
 import java.io.{FileNotFoundException, IOException}
 import java.nio.charset.StandardCharsets
 import java.util
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import java.util.function.Consumer
+
+import scala.collection.mutable.ArrayBuffer
 
 import com.google.common.base.Throwables
 import com.google.protobuf.GeneratedMessageV3
@@ -39,8 +41,8 @@ import org.apache.celeborn.common.network.server.BaseMessageHandler
 import org.apache.celeborn.common.network.util.{NettyUtils, TransportConf}
 import org.apache.celeborn.common.protocol.{MessageType, PbBufferStreamEnd, PbChunkFetchRequest, PbNotifyRequiredSegment, PbOpenStream, PbOpenStreamList, PbOpenStreamListResponse, PbReadAddCredit, PbStreamHandler, PbStreamHandlerOpt, StreamType}
 import org.apache.celeborn.common.protocol.message.StatusCode
-import org.apache.celeborn.common.util.{ExceptionUtils, Utils}
-import org.apache.celeborn.service.deploy.worker.storage.{ChunkStreamManager, CreditStreamManager, PartitionFilesSorter, StorageManager}
+import org.apache.celeborn.common.util.{ExceptionUtils, JavaUtils, Utils}
+import org.apache.celeborn.service.deploy.worker.storage.{ChunkStreamManager, CreditStreamManager, FileResolvedCallback, PartitionFilesSorter, StorageManager}
 
 class FetchHandler(
     val conf: CelebornConf,
@@ -145,25 +147,64 @@ class FetchHandler(
         val readLocalFlags = openStreamList.getReadLocalShuffleList
         val pbOpenStreamListResponse = PbOpenStreamListResponse.newBuilder()
         checkAuth(client, Utils.splitShuffleKey(shuffleKey)._1)
+        val replied = new AtomicBoolean
+        val pbStreamHandlerOpts = new ArrayBuffer[PbStreamHandlerOpt]
         0 until files.size() foreach { idx =>
-          val pbStreamHandlerOpt = handleReduceOpenStreamInternal(
-            client,
-            shuffleKey,
-            files.get(idx),
-            startIndices.get(idx),
-            endIndices.get(idx),
-            readLocalFlags.get(idx))
-          if (pbStreamHandlerOpt.getStatus != StatusCode.SUCCESS.getValue) {
-            workerSource.incCounter(WorkerSource.OPEN_STREAM_FAIL_COUNT)
-          }
-          pbOpenStreamListResponse.addStreamHandlerOpt(pbStreamHandlerOpt)
-        }
+          val fileName = files.get(idx)
+          val startMapIndex = startIndices.get(idx)
+          val endMapIndex = endIndices.get(idx)
+          val fileInfo = getRawFileInfo(shuffleKey, fileName)
+          val readLocalFlag = readLocalFlags.get(idx)
+          val streamId = chunkStreamManager.nextStreamId()
+          val fileResolvedCallback = new FileResolvedCallback {
 
-        client.getChannel.writeAndFlush(new RpcResponse(
-          rpcRequest.requestId,
-          new NioManagedBuffer(new TransportMessage(
-            MessageType.BATCH_OPEN_STREAM_RESPONSE,
-            pbOpenStreamListResponse.build().toByteArray).toByteBuffer)))
+            override def onSuccess(sortedFileInfo: FileInfo): Unit = {
+              val pbStreamHandlerOpt =
+                registerAndHandleStream(
+                  client,
+                  shuffleKey,
+                  fileName,
+                  startMapIndex,
+                  endMapIndex,
+                  readLocalFlag,
+                  fileInfo,
+                  streamId)
+              if (pbStreamHandlerOpt.getStatus != StatusCode.SUCCESS.getValue) {
+                workerSource.incCounter(WorkerSource.OPEN_STREAM_FAIL_COUNT)
+              }
+              pbStreamHandlerOpts.synchronized {
+                pbStreamHandlerOpts.append(pbStreamHandlerOpt)
+              }
+              if (pbStreamHandlerOpts.length >= files.size() &&
+                replied.compareAndSet(false, true)) {
+                client.getChannel.writeAndFlush(new RpcResponse(
+                  rpcRequest.requestId,
+                  new NioManagedBuffer(new TransportMessage(
+                    MessageType.BATCH_OPEN_STREAM_RESPONSE,
+                    pbOpenStreamListResponse.build().toByteArray).toByteBuffer)))
+              }
+            }
+
+            override def onFailure(e: Throwable): Unit = {
+              if (replied.compareAndSet(false, true)) {
+                handleRpcIOException(
+                  client,
+                  rpcRequest.requestId,
+                  shuffleKey,
+                  fileName,
+                  ExceptionUtils.wrapThrowableToIOException(e),
+                  callback)
+              }
+            }
+          }
+          partitionsSorter.getSortedFileInfo(
+            shuffleKey,
+            fileName,
+            fileInfo,
+            startMapIndex,
+            endMapIndex,
+            fileResolvedCallback)
+        }
       case bufferStreamEnd: PbBufferStreamEnd =>
         handleEndStreamFromClient(
           client,
@@ -236,110 +277,82 @@ class FetchHandler(
 
   }
 
-  private def handleReduceOpenStreamInternal(
+  private def registerAndHandleStream(
       client: TransportClient,
       shuffleKey: String,
       fileName: String,
       startIndex: Int,
       endIndex: Int,
-      readLocalShuffle: Boolean = false): PbStreamHandlerOpt = {
-    try {
-      logDebug(s"Received open stream request $shuffleKey $fileName $startIndex " +
-        s"$endIndex get file name $fileName from client channel " +
-        s"${NettyUtils.getRemoteAddress(client.getChannel)}")
-
-      var fileInfo = getRawFileInfo(shuffleKey, fileName)
-      val streamId = chunkStreamManager.nextStreamId()
-      // we must get sorted fileInfo for the following cases.
-      // 1. when the current request is a non-range openStream, but the original unsorted file
-      //    has been deleted by another range's openStream request.
-      // 2. when the current request is a range openStream request.
-      if ((endIndex != Int.MaxValue && endIndex != -1 && endIndex >= startIndex) || (endIndex == Int.MaxValue && !fileInfo.addStream(
-          streamId))) {
-        fileInfo = partitionsSorter.getSortedFileInfo(
+      readLocalShuffle: Boolean,
+      fileInfo: FileInfo,
+      streamId: Long) = {
+    val meta = fileInfo.getReduceFileMeta
+    val streamHandler =
+      if (readLocalShuffle && !fileInfo.isInstanceOf[MemoryFileInfo]) {
+        chunkStreamManager.registerStream(
+          streamId,
           shuffleKey,
-          fileName,
-          fileInfo,
-          startIndex,
-          endIndex)
-      }
-      val meta = fileInfo.getReduceFileMeta
-      val streamHandler =
-        if (readLocalShuffle && !fileInfo.isInstanceOf[MemoryFileInfo]) {
+          fileName)
+        makeStreamHandler(
+          streamId,
+          meta.getNumChunks,
+          meta.getChunkOffsets,
+          fileInfo.asInstanceOf[DiskFileInfo].getFilePath)
+      } else fileInfo match {
+        case info: DiskFileInfo if info.isHdfs =>
           chunkStreamManager.registerStream(
             streamId,
             shuffleKey,
             fileName)
+          makeStreamHandler(streamId, numChunks = 0)
+        case info: DiskFileInfo if info.isS3 =>
+          chunkStreamManager.registerStream(
+            streamId,
+            shuffleKey,
+            fileName)
+          makeStreamHandler(streamId, numChunks = 0)
+        case info: DiskFileInfo if info.isOSS =>
+          chunkStreamManager.registerStream(
+            streamId,
+            shuffleKey,
+            fileName)
+          makeStreamHandler(streamId, numChunks = 0)
+        case _ =>
+          val managedBuffer = fileInfo match {
+            case df: DiskFileInfo =>
+              new FileChunkBuffers(df, transportConf)
+            case mf: MemoryFileInfo =>
+              new MemoryChunkBuffers(mf)
+          }
+          val fetchTimeMetric =
+            fileInfo match {
+              case info: DiskFileInfo =>
+                storageManager.getFetchTimeMetric(info.getFile)
+              case _ =>
+                null
+            }
+          chunkStreamManager.registerStream(
+            streamId,
+            shuffleKey,
+            managedBuffer,
+            fileName,
+            fetchTimeMetric)
+          if (meta.getNumChunks == 0)
+            logDebug(s"StreamId $streamId, fileName $fileName, mapRange " +
+              s"[$startIndex-$endIndex] is empty. Received from client channel " +
+              s"${NettyUtils.getRemoteAddress(client.getChannel)}")
+          else logDebug(
+            s"StreamId $streamId, fileName $fileName, numChunks ${meta.getNumChunks}, " +
+              s"mapRange [$startIndex-$endIndex]. Received from client channel " +
+              s"${NettyUtils.getRemoteAddress(client.getChannel)}")
           makeStreamHandler(
             streamId,
-            meta.getNumChunks,
-            meta.getChunkOffsets,
-            fileInfo.asInstanceOf[DiskFileInfo].getFilePath)
-        } else fileInfo match {
-          case info: DiskFileInfo if info.isHdfs =>
-            chunkStreamManager.registerStream(
-              streamId,
-              shuffleKey,
-              fileName)
-            makeStreamHandler(streamId, numChunks = 0)
-          case info: DiskFileInfo if info.isS3 =>
-            chunkStreamManager.registerStream(
-              streamId,
-              shuffleKey,
-              fileName)
-            makeStreamHandler(streamId, numChunks = 0)
-          case info: DiskFileInfo if info.isOSS =>
-            chunkStreamManager.registerStream(
-              streamId,
-              shuffleKey,
-              fileName)
-            makeStreamHandler(streamId, numChunks = 0)
-          case _ =>
-            val managedBuffer = fileInfo match {
-              case df: DiskFileInfo =>
-                new FileChunkBuffers(df, transportConf)
-              case mf: MemoryFileInfo =>
-                new MemoryChunkBuffers(mf)
-            }
-            val fetchTimeMetric =
-              fileInfo match {
-                case info: DiskFileInfo =>
-                  storageManager.getFetchTimeMetric(info.getFile)
-                case _ =>
-                  null
-              }
-            chunkStreamManager.registerStream(
-              streamId,
-              shuffleKey,
-              managedBuffer,
-              fileName,
-              fetchTimeMetric)
-            if (meta.getNumChunks == 0)
-              logDebug(s"StreamId $streamId, fileName $fileName, mapRange " +
-                s"[$startIndex-$endIndex] is empty. Received from client channel " +
-                s"${NettyUtils.getRemoteAddress(client.getChannel)}")
-            else logDebug(
-              s"StreamId $streamId, fileName $fileName, numChunks ${meta.getNumChunks}, " +
-                s"mapRange [$startIndex-$endIndex]. Received from client channel " +
-                s"${NettyUtils.getRemoteAddress(client.getChannel)}")
-            makeStreamHandler(
-              streamId,
-              meta.getNumChunks)
-        }
-      workerSource.incCounter(WorkerSource.OPEN_STREAM_SUCCESS_COUNT)
-      PbStreamHandlerOpt.newBuilder().setStreamHandler(streamHandler)
-        .setStatus(StatusCode.SUCCESS.getValue)
-        .build()
-    } catch {
-      case e: IOException =>
-        val msg =
-          s"Read file: $fileName with shuffleKey: $shuffleKey error from ${NettyUtils.getRemoteAddress(
-            client.getChannel)}, Exception: ${e.getMessage}"
-        PbStreamHandlerOpt.newBuilder().setStatus(StatusCode.OPEN_STREAM_FAILED.getValue)
-          .setErrorMsg(msg).build()
-    } finally {
-      workerSource.stopTimer(WorkerSource.OPEN_STREAM_TIME, shuffleKey)
-    }
+            meta.getNumChunks)
+      }
+    workerSource.incCounter(WorkerSource.OPEN_STREAM_SUCCESS_COUNT)
+    PbStreamHandlerOpt.newBuilder().setStreamHandler(streamHandler)
+      .setStatus(StatusCode.SUCCESS.getValue)
+      .build()
   }
 
   private def handleOpenStreamInternal(
@@ -360,23 +373,71 @@ class FetchHandler(
       client.getChannel.id().toString,
       rpcRequestId)
     workerSource.startTimer(WorkerSource.OPEN_STREAM_TIME, requestId)
+    var asyncReplied = false;
     try {
       val fileInfo = getRawFileInfo(shuffleKey, fileName)
       fileInfo.getFileMeta match {
         case _: ReduceFileMeta =>
-          val pbStreamHandlerOpt =
-            handleReduceOpenStreamInternal(
-              client,
-              shuffleKey,
-              fileName,
-              startIndex,
-              endIndex,
-              readLocalShuffle)
+          val fileInfo = getRawFileInfo(shuffleKey, fileName)
+          val streamId = chunkStreamManager.nextStreamId()
+          partitionsSorter.getSortedFileInfo(
+            shuffleKey,
+            fileName,
+            fileInfo,
+            startIndex,
+            endIndex,
+            new FileResolvedCallback {
+              private var timerStopped = false
 
-          if (pbStreamHandlerOpt.getStatus != StatusCode.SUCCESS.getValue) {
-            throw new CelebornIOException(pbStreamHandlerOpt.getErrorMsg)
-          }
-          replyStreamHandler(client, rpcRequestId, pbStreamHandlerOpt.getStreamHandler, isLegacy)
+              override def onSuccess(sortedFileInfo: FileInfo): Unit = {
+                try {
+                  val pbStreamHandlerOpt =
+                    registerAndHandleStream(
+                      client,
+                      shuffleKey,
+                      fileName,
+                      startIndex,
+                      endIndex,
+                      readLocalShuffle,
+                      fileInfo,
+                      streamId)
+
+                  if (pbStreamHandlerOpt.getStatus != StatusCode.SUCCESS.getValue) {
+                    throw new CelebornIOException(pbStreamHandlerOpt.getErrorMsg)
+                  }
+                  replyStreamHandler(
+                    client,
+                    rpcRequestId,
+                    pbStreamHandlerOpt.getStreamHandler,
+                    isLegacy)
+                } catch {
+                  case t: Throwable =>
+                    onFailure(t)
+                } finally {
+                  stopTimerIfNeeded()
+                }
+              }
+
+              override def onFailure(e: Throwable): Unit = {
+                workerSource.incCounter(WorkerSource.OPEN_STREAM_FAIL_COUNT)
+                handleRpcIOException(
+                  client,
+                  rpcRequestId,
+                  shuffleKey,
+                  fileName,
+                  ExceptionUtils.wrapThrowableToIOException(e),
+                  callback)
+                stopTimerIfNeeded()
+              }
+
+              private def stopTimerIfNeeded(): Unit = {
+                if (!timerStopped) {
+                  workerSource.stopTimer(WorkerSource.OPEN_STREAM_TIME, requestId)
+                  timerStopped = true
+                }
+              }
+            })
+          asyncReplied = true
         case _: MapFileMeta =>
           val creditStreamHandler =
             new Consumer[java.lang.Long] {
@@ -404,7 +465,9 @@ class FetchHandler(
         workerSource.incCounter(WorkerSource.OPEN_STREAM_FAIL_COUNT)
         handleRpcIOException(client, rpcRequestId, shuffleKey, fileName, e, callback)
     } finally {
-      workerSource.stopTimer(WorkerSource.OPEN_STREAM_TIME, requestId)
+      if (!asyncReplied) {
+        workerSource.stopTimer(WorkerSource.OPEN_STREAM_TIME, requestId)
+      }
     }
   }
 
