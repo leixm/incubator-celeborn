@@ -680,4 +680,9 @@ public class SparkUtils {
     String master = conf.get("spark.master", "");
     return master.equals("local") || master.startsWith("local[");
   }
+
+  public static boolean isLocalMaster1(SparkConf conf) {
+    String master = conf.get("spark.master", "");
+    return master.equals("local") || master.startsWith("local[");
+  }
 }
